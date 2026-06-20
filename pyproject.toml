@@ -1,0 +1,33 @@
+[project]
+name = "inventory-dss-ftgm-engine"
+version = "0.1.0"
+description = "FTGM forecasting engine for the Inventory Optimization DSS Platform."
+requires-python = ">=3.11"
+dependencies = [
+"fastapi",
+"uvicorn[standard]",
+"pydantic",
+"pydantic-settings",
+"numpy",
+"pandas",
+"scipy",
+"scikit-learn",
+"statsmodels"
+]
+
+[project.optional-dependencies]
+dev = [
+"pytest",
+"pytest-asyncio",
+"ruff",
+"mypy",
+"jupyter"
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
