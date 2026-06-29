@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "inventory-dss-ftgm-engine"
 version = "0.1.0"
@@ -23,6 +27,9 @@ dev = [
 "mypy",
 "jupyter"
 ]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
 
 [tool.ruff]
 line-length = 100
