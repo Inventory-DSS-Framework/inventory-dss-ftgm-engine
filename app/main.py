@@ -10,6 +10,11 @@ def create_app() -> FastAPI:
         version="0.1.0"
     )
 
+    # Public liveness endpoint (used by platform health checks).
+    @app.get("/health", tags=["System"])
+    def health() -> dict[str, str]:
+        return {"status": "ok"}
+
     app.include_router(router, prefix=settings.api_v1_prefix)
 
     return app

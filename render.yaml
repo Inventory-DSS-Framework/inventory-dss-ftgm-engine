@@ -1,0 +1,20 @@
+# Render Blueprint — FTGM analytical engine
+#
+# Stateless FastAPI service (numpy/scipy). No database, no secrets.
+# Only the Inventory DSS API calls it (server-to-server), but on the free tier
+# there is no private networking, so it gets a public URL. Copy that URL (with the
+# /api/v1 suffix) into the API service's FTGM_ENGINE_BASE_URL variable.
+
+services:
+  - type: web
+    name: inventory-dss-ftgm-engine
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: APP_DEBUG
+        value: "false"
