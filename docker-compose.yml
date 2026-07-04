@@ -1,0 +1,15 @@
+# FTGM analytical engine — standalone local container.
+# Run:  docker compose up --build
+#
+# Stateless (no database). Published on host port 8010; the API reaches it via
+# host.docker.internal:8010. Health check: http://localhost:8010/health
+
+services:
+  ftgm:
+    build: .
+    container_name: inventory_dss_ftgm
+    ports:
+      - "8010:8010"
+    environment:
+      APP_ENV: development
+      APP_DEBUG: "true"

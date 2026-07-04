@@ -43,8 +43,12 @@ def _nyquist_cap(period: int) -> int:
 
 
 def _default_validation_size(n_obs: int, period: int) -> int:
-    """A modest hold-out: about one season, but never more than a quarter of the data."""
-    return max(1, min(period, n_obs // 4))
+    """A modest hold-out: about **half a season**, but never more than a quarter of the data.
+
+    Mirrors the paper's setup (6 validation months for monthly data, T = 12).
+    """
+    half_season = max(1, period // 2)
+    return max(1, min(half_season, n_obs // 4))
 
 
 def select_order(
@@ -79,7 +83,9 @@ def select_order(
     train, valid = x[:train_len], x[train_len:]
 
     nyquist = _nyquist_cap(cfg.period)
-    data_cap = (train_len - 2) // 4  # so that (train_len - 1) >= n_params(N)
+    # Identifiability: fitting order N needs (train_len - 1) >= n_params(N) = 2 + 4N,
+    # i.e. N <= (train_len - 3) / 4.
+    data_cap = (train_len - 3) // 4
     upper = min(nyquist, data_cap, max_order if max_order is not None else nyquist)
     if upper < 1:
         return OrderSelection(best_order=1, scores={1: float("nan")}, validation_size=val)
