@@ -77,6 +77,8 @@ _GUARD_REL_RMSE = 0.25
 #: Model tournament: rolling origins per period and the FTGM tie margin (MAE ratio).
 _ORIGINS = {12: 6, 52: 8, 4: 4}
 _FTGM_TIE = 1.03
+#: Recent window (periods) the forecast is compared with to describe the trend.
+_TREND_WINDOW = {12: 3, 52: 12, 4: 2}
 #: Ridge penalties tried by Algorithm 1 together with the Fourier order (0 = paper OLS).
 _RIDGE_GRID = (0.0, 0.5, 3.0, 10.0)
 _FTGM_FAMILY = ("FTGM", "FTGMCombo")
@@ -692,7 +694,10 @@ class ForecastService:
     @staticmethod
     def _explain_forecast(diag: ProductDiagnostics, point: FloatArray, history: FloatArray, period: int) -> None:
         h = point.size
-        recent = history[-h:] if history.size >= h else history
+        # Compare with a steadier recent level (>= 3 months / 12 weeks), not the single
+        # last period: one noisy month would otherwise read as a +/-30% "trend".
+        window = max(h, _TREND_WINDOW.get(period, 3))
+        recent = history[-window:] if history.size >= window else history
         if recent.size and float(np.sum(recent)) > 0:
             scaled = float(np.sum(recent)) * (h / recent.size)
             pct = 100.0 * (float(np.sum(point)) - scaled) / scaled
@@ -700,7 +705,8 @@ class ForecastService:
             if abs(pct) >= 3:
                 diag.explanations.append(
                     f"Se proyectan {float(np.sum(point)):.0f} unidades en {_plural(h, period)}, "
-                    f"{abs(pct):.0f}% {'más' if pct > 0 else 'menos'} que los últimos {_plural(h, period)}."
+                    f"{abs(pct):.0f}% {'más' if pct > 0 else 'menos'} que el ritmo de los últimos "
+                    f"{_plural(recent.size, period)}."
                 )
             else:
                 diag.explanations.append(
