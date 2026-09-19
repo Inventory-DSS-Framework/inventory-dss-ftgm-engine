@@ -6,6 +6,15 @@ in one call) and returns, per product, the point forecast with a prediction inte
 the Fourier order that was selected, the aggregated in-sample history (with the model
 fit), accuracy metrics, and diagnostics explaining what the pipeline did.
 
+Two ways to call it:
+
+* **Legacy** — ``period`` (seasonal period T) + ``horizon`` (periods). Every product is
+  aggregated with that period.
+* **Frequency-aware** — ``frequency`` (``auto`` | ``monthly`` | ``weekly``) +
+  ``horizon_days`` + ``as_of``. The engine decides the bucket size per product (monthly
+  with >= 24 months of history, weekly with >= 26 weeks, otherwise a short-history
+  baseline), drops the period in progress and converts the day horizon to periods.
+
 Backward compatibility: every field added on top of the original contract has a
 default, so an older client simply ignores the extras.
 """
@@ -14,10 +23,12 @@ from __future__ import annotations
 from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # ``model`` is a meaningful field name here; opt out of pydantic's ``model_`` guard.
 _ALLOW_MODEL_FIELD = ConfigDict(protected_namespaces=())
+
+Frequency = Literal["auto", "monthly", "weekly"]
 
 
 class ObservationPoint(BaseModel):
@@ -42,8 +53,19 @@ class ForecastRequest(BaseModel):
 
     model: str = "FTGM"
     period: int = Field(default=12, gt=0, description="Seasonal period T (12 = monthly)")
-    horizon: int = Field(gt=0, le=104, description="Number of periods to forecast")
+    horizon: int | None = Field(
+        default=None, gt=0, le=104, description="Number of periods to forecast (legacy)"
+    )
     series: list[ProductSeries]
+    frequency: Frequency | None = Field(
+        default=None, description="Bucket size; None keeps the legacy `period` behaviour"
+    )
+    horizon_days: int | None = Field(
+        default=None, gt=0, le=730, description="Horizon in days (converted per frequency)"
+    )
+    as_of: date | None = Field(
+        default=None, description="Cut-off: the period containing this date is excluded"
+    )
     # Optional overrides for Algorithm 1 (defaults follow the paper).
     validation_size: int | None = Field(
         default=None, gt=0, description="Hold-out size for order selection (default: T/2)"
@@ -51,6 +73,12 @@ class ForecastRequest(BaseModel):
     max_order: int | None = Field(
         default=None, gt=0, description="Cap on the candidate Fourier orders"
     )
+
+    @model_validator(mode="after")
+    def _horizon_given(self) -> "ForecastRequest":
+        if self.horizon is None and self.horizon_days is None:
+            raise ValueError("either `horizon` or `horizon_days` is required")
+        return self
 
 
 class ForecastPoint(BaseModel):
@@ -66,9 +94,10 @@ class HistoryPoint(BaseModel):
     """One in-sample period: what was observed, what the model consumed and produced.
 
     ``observed``   – aggregated demand for the bucket (raw sum).
-    ``cleaned``    – demand after stock-out imputation (what the model was fit on).
+    ``cleaned``    – demand after stock-out repair and outlier treatment (model input).
     ``fitted``     – the model's in-sample fit for the bucket (None for skipped series).
-    ``is_stockout``– the bucket contained at least one stock-out observation.
+    ``is_stockout``– the bucket was censored by a stock-out (>= 10% of it).
+    ``is_outlier`` – the bucket was treated as an outlier (Hampel filter).
     """
 
     date: date
@@ -76,6 +105,8 @@ class HistoryPoint(BaseModel):
     cleaned: float
     fitted: float | None = None
     is_stockout: bool = False
+    is_outlier: bool = False
+    stockout_share: float = 0.0
 
 
 class ForecastMetrics(BaseModel):
@@ -86,6 +117,17 @@ class ForecastMetrics(BaseModel):
     mape: float | None = None
     mase: float | None = None
     rmsse: float | None = None
+
+
+class HoldoutMetrics(BaseModel):
+    """Out-of-sample accuracy from rolling-origin evaluation."""
+
+    origins: int
+    horizon: int
+    mae: float | None = None
+    rmse: float | None = None
+    mape: float | None = None
+    mase: float | None = None
 
 
 class ProductDiagnostics(BaseModel):
@@ -105,6 +147,29 @@ class ProductDiagnostics(BaseModel):
     validation_rmse: float | None = Field(
         default=None, description="Validation RMSE of the selected order"
     )
+    # --- frequency-aware pipeline evidence ------------------------------------------
+    frequency: str | None = None
+    period: int | None = None
+    frequency_reason: str | None = None
+    history_start: date | None = None
+    history_end: date | None = None
+    dropped_incomplete_period: bool = False
+    outliers_cleaned: int = 0
+    zero_share: float | None = None
+    intermittent: bool = False
+    seasonality_strength: float | None = None
+    trend_pct_per_period: float | None = None
+    max_order_allowed: int | None = None
+    holdout: HoldoutMetrics | None = None
+    naive_holdout: HoldoutMetrics | None = None
+    skill_vs_naive: float | None = Field(
+        default=None, description="1 - RMSE(model)/RMSE(seasonal naive) on the same origins"
+    )
+    interval_level: float | None = None
+    forecast_vs_recent_pct: float | None = Field(
+        default=None, description="Forecast total vs the same number of recent periods (%)"
+    )
+    explanations: list[str] = Field(default_factory=list)
 
 
 class ProductForecast(BaseModel):
@@ -118,6 +183,8 @@ class ProductForecast(BaseModel):
     status: Literal["ok", "fallback", "skipped"] = "ok"
     fallback_reason: str | None = None
     warnings: list[str] = Field(default_factory=list)
+    frequency: str | None = None
+    period: int | None = None
     points: list[ForecastPoint]
     history: list[HistoryPoint] = Field(default_factory=list)
     metrics: ForecastMetrics
