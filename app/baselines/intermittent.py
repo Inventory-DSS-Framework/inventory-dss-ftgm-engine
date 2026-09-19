@@ -30,8 +30,12 @@ def croston_sba(demand: FloatArray, horizon: int, alpha: float = 0.1) -> tuple[F
 
     correction = 1.0 - alpha / 2.0
     first = int(nonzero[0])
-    z = float(x[first])  # smoothed non-zero demand size
-    p = float(first + 1)  # smoothed inter-demand interval
+    # Initialise from the whole series, not just the first event: the mean demand size
+    # and the mean inter-demand interval (n / #events). Starting from the first event
+    # alone made a product with one early sale forecast that rate forever (p started
+    # at 1 and, with no further events, never updated).
+    z = float(np.mean(x[nonzero]))  # smoothed non-zero demand size
+    p = float(n / nonzero.size)  # smoothed inter-demand interval
     q = 1  # periods since the last demand
     fitted = np.empty(n)
     fitted[: first + 1] = correction * z / p

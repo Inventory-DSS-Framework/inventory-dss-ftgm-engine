@@ -39,11 +39,22 @@ class HoldoutScore:
     #: Same, on the *total* of each origin's horizon — the number replenishment cares
     #: about ("how many units will I sell next month"), far less noisy than per period.
     total_wape: float | None = None
+    #: Units actually sold over every scored period. Tiny totals make percentage errors
+    #: meaningless (sell 3, predict 7 → "133% off"), so accuracy_pct hides behind it.
+    holdout_units: float = 0.0
+
+    #: Below this many units sold in the holdout, a percentage says nothing.
+    MIN_UNITS_TO_SCORE = 10.0
 
     @property
     def accuracy_pct(self) -> float | None:
-        """Plain-language accuracy: 100 - total WAPE, clipped to [0, 100]."""
-        if self.total_wape is None:
+        """Plain-language accuracy: 100 - total WAPE, clipped to [0, 100].
+
+        None when the holdout barely had sales — a relative error over a handful of
+        units is noise, and reporting "0%" there reads as "broken" instead of
+        "not enough history yet".
+        """
+        if self.total_wape is None or self.holdout_units < self.MIN_UNITS_TO_SCORE:
             return None
         return max(0.0, min(100.0, 100.0 - self.total_wape))
 
@@ -118,4 +129,5 @@ def rolling_origin(
         rmse_by_step=by_step,
         wape=fin(wape),
         total_wape=fin(total_wape),
+        holdout_units=act_sum,
     )
