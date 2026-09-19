@@ -88,7 +88,7 @@ def test_baseline_fallback_reports_reason_and_honest_interval() -> None:
     fc = ForecastService().forecast(request).forecasts[0]
 
     if fc.status == "fallback":  # FTGM may or may not survive; if it fell back, verify honesty
-        assert fc.model == "SeasonalNaive"
+        assert fc.model in ("SeasonalNaive", "DampedTrend", "SeasonalDamped")
         assert fc.fallback_reason
         # Interval must not pretend zero uncertainty (unless residuals are truly zero).
         widths = [p.upper_bound - p.lower_bound for p in fc.points]

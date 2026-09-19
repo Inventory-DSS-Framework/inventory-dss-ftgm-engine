@@ -128,6 +128,18 @@ class HoldoutMetrics(BaseModel):
     rmse: float | None = None
     mape: float | None = None
     mase: float | None = None
+    wape: float | None = None
+    total_wape: float | None = None
+
+
+class CandidateScore(BaseModel):
+    """One contender of the model tournament, scored on the same rolling origins."""
+
+    model: str
+    mae: float | None = None
+    wape: float | None = None
+    accuracy_pct: float | None = None
+    chosen: bool = False
 
 
 class ProductDiagnostics(BaseModel):
@@ -166,6 +178,11 @@ class ProductDiagnostics(BaseModel):
         default=None, description="1 - RMSE(model)/RMSE(seasonal naive) on the same origins"
     )
     interval_level: float | None = None
+    accuracy_pct: float | None = Field(
+        default=None,
+        description="Plain accuracy of the chosen model on past data: 100 - WAPE of the horizon total",
+    )
+    candidates: list[CandidateScore] = Field(default_factory=list)
     forecast_vs_recent_pct: float | None = Field(
         default=None, description="Forecast total vs the same number of recent periods (%)"
     )

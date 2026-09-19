@@ -34,6 +34,18 @@ class HoldoutScore:
     mape: float | None
     mase: float | None
     rmse_by_step: list[float] = field(default_factory=list)
+    #: Sum |error| / sum actual over every scored period (robust MAPE for small counts).
+    wape: float | None = None
+    #: Same, on the *total* of each origin's horizon — the number replenishment cares
+    #: about ("how many units will I sell next month"), far less noisy than per period.
+    total_wape: float | None = None
+
+    @property
+    def accuracy_pct(self) -> float | None:
+        """Plain-language accuracy: 100 - total WAPE, clipped to [0, 100]."""
+        if self.total_wape is None:
+            return None
+        return max(0.0, min(100.0, 100.0 - self.total_wape))
 
 
 def _naive_scale(train: FloatArray, period: int) -> float:
@@ -87,6 +99,11 @@ def rolling_origin(
     scale = float(np.mean(scales)) if scales else 0.0
     mase = mae / scale if scale > 0 else None
     by_step = [float(np.sqrt(np.mean(err[:, s] ** 2))) for s in range(h)]
+    act_sum = float(np.sum(act))
+    wape = float(np.sum(abs_err) / act_sum * 100.0) if act_sum > 0 else None
+    tot_act = act.sum(axis=1)
+    tot_err = np.abs(err.sum(axis=1))
+    total_wape = float(np.sum(tot_err) / np.sum(tot_act) * 100.0) if float(np.sum(tot_act)) > 0 else None
 
     def fin(v: float | None) -> float | None:
         return v if v is not None and math.isfinite(v) else None
@@ -99,4 +116,6 @@ def rolling_origin(
         mape=fin(mape),
         mase=fin(mase),
         rmse_by_step=by_step,
+        wape=fin(wape),
+        total_wape=fin(total_wape),
     )

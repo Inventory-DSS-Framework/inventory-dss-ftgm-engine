@@ -35,7 +35,9 @@ def test_forecast_batch_pipeline() -> None:
     fc = response.forecasts[0]
     assert fc.product_id == "prod-1"
     assert len(fc.points) == 6
-    assert fc.order_selected >= 1  # enough data -> real FTGM, not the baseline
+    # Enough data -> the FTGM competes; whichever wins, the FTGM order was identified.
+    assert fc.diagnostics is not None and any(c.model == "FTGM" for c in fc.diagnostics.candidates)
+    assert fc.diagnostics.order_scores
     assert fc.metrics.rmse is not None
 
     # Forecast dates advance monthly and the interval is well-ordered.
@@ -54,7 +56,8 @@ def test_short_series_falls_back_to_baseline() -> None:
     response = ForecastService().forecast(request)
     fc = response.forecasts[0]
     assert fc.order_selected == 0  # baseline fallback
-    assert fc.model == "SeasonalNaive"
+    assert fc.model in ("SeasonalNaive", "DampedTrend")
+    assert fc.status == "fallback"
     assert len(fc.points) == 3
 
 

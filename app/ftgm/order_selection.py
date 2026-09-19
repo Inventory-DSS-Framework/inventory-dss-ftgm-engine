@@ -11,11 +11,15 @@ cannot describe the seasonal shape; too high and it overfits the noise. The pape
 
 The candidate set is bounded above by the Nyquist-Shannon limit ``N < T / (2h)`` and,
 in practice, by how many parameters the (short) training series can identify.
+
+Extension: the same validation also picks the ridge penalty of the estimation from
+``ridges`` (0 = the paper's OLS). Clean seasonal series keep 0; short noisy MYPE series
+need shrinkage, and the validation set decides which case a product is.
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 from numpy.typing import NDArray
@@ -35,6 +39,8 @@ class OrderSelection:
     best_order: int
     scores: dict[int, float]  # validation RMSE per candidate order (nan = failed/skipped)
     validation_size: int
+    #: Ridge penalty chosen jointly with the order (see ``FTGMConfig.ridge``).
+    best_ridge: float = 0.0
 
 
 def _nyquist_cap(period: int) -> int:
@@ -57,6 +63,7 @@ def select_order(
     *,
     validation_size: int | None = None,
     max_order: int | None = None,
+    ridges: tuple[float, ...] | None = None,
 ) -> OrderSelection:
     """Choose the best Fourier order for ``demand`` via the validation strategy."""
     cfg = config or FTGMConfig()
@@ -90,15 +97,25 @@ def select_order(
     if upper < 1:
         return OrderSelection(best_order=1, scores={1: float("nan")}, validation_size=val)
 
+    grid = ridges if ridges else (cfg.ridge,)
     scores: dict[int, float] = {}
+    best_ridge: dict[int, float] = {}
     for order in range(1, upper + 1):
-        try:
-            model = FTGM(order=order, config=cfg).fit(train)
-            forecast = model.predict(val)
-            scores[order] = root_mean_squared_error(valid, forecast.point)
-        except FTGMError:
-            scores[order] = float("nan")  # unstable order — keep it out of the running
+        scores[order] = float("nan")  # unstable for every penalty -> out of the running
+        for ridge in grid:
+            try:
+                model = FTGM(order=order, config=replace(cfg, ridge=ridge)).fit(train)
+                rmse = root_mean_squared_error(valid, model.predict(val).point)
+            except FTGMError:
+                continue
+            if math.isfinite(rmse) and not rmse >= scores[order]:
+                scores[order], best_ridge[order] = rmse, ridge
 
     finite = {k: v for k, v in scores.items() if math.isfinite(v)}
     best_order = min(finite, key=lambda k: finite[k]) if finite else 1
-    return OrderSelection(best_order=best_order, scores=scores, validation_size=val)
+    return OrderSelection(
+        best_order=best_order,
+        scores=scores,
+        validation_size=val,
+        best_ridge=best_ridge.get(best_order, cfg.ridge),
+    )

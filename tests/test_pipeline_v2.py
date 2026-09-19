@@ -85,9 +85,13 @@ def test_auto_frequency_monthly_with_long_history() -> None:
     fc = ForecastService().forecast(_request(pts, frequency="auto", horizon_days=90, as_of=as_of)).forecasts[0]
     assert fc.frequency == "monthly" and fc.period == 12
     assert len(fc.points) == 3
-    assert fc.status == "ok" and fc.order_selected >= 1
     d = fc.diagnostics
     assert d is not None and d.holdout is not None and d.explanations
+    # The FTGM took part in the tournament and the winner is the most accurate contender.
+    assert any(c.model == "FTGM" for c in d.candidates)
+    chosen = next(c for c in d.candidates if c.chosen)
+    assert chosen.mae is not None and chosen.mae <= 1.03 * min(c.mae for c in d.candidates if c.mae is not None)
+    assert d.accuracy_pct is not None and 0 <= d.accuracy_pct <= 100
     assert d.seasonality_strength is not None
     assert all(p.predicted_demand >= 0 and p.lower_bound <= p.predicted_demand <= p.upper_bound for p in fc.points)
 

@@ -8,10 +8,14 @@ Glues the pure FTGM core to the HTTP contract. For each product in the batch it 
     3. censoring   — repair demand in stock-out periods (scale up / interpolate);
     4. intermittency — > 50% zero periods -> Croston-SBA instead of the FTGM;
     5. outliers    — Hampel filter on the deseasonalised series;
-    6. FTGM        — Fourier order chosen by Algorithm 1 inside a history-length cap,
-                     fit, forecast;
-    7. validation  — rolling-origin hold-out vs seasonal naive (honest accuracy, guard
-                     against a clearly worse model, empirical prediction interval);
+    6. FTGM        — Fourier order chosen by Algorithm 1 inside a history-length cap
+                     (ridge-regularised estimation, see ``FTGMConfig.ridge``);
+    7. tournament  — rolling-origin hold-out of the FTGM, the FTGM combined with the
+                     seasonal naive, a damped-trend smoother, the seasonal naive and a
+                     seasonal smoother on the *same* past origins; the fewest units missed
+                     wins, technical ties go to the FTGM family. The winner's hold-out
+                     gives the plain accuracy (100 - WAPE of the horizon total) and the
+                     empirical prediction interval;
     8. diagnostics — every decision explained in plain Spanish.
 
 Failure isolation is per product: too short / unstable -> transparent baseline with the
@@ -21,20 +25,23 @@ the batch. Forecasts are always finite and non-negative.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
+from typing import Callable
 
 import numpy as np
 from numpy.typing import NDArray
 
 from app.baselines import seasonal_naive_forecast
 from app.baselines.intermittent import croston_sba, moving_average_forecast
+from app.baselines.smoothing import damped_trend_forecast, seasonal_damped_forecast
 from app.ftgm import FTGM, FTGMConfig, FTGMError, select_order
 from app.ftgm import cleaning
 from app.ftgm import metrics as M
 from app.ftgm import preprocessing as prep
 from app.ftgm.validation import HoldoutScore, rolling_origin
 from app.presentation.schemas import (
+    CandidateScore,
     ForecastMetrics,
     ForecastPoint,
     ForecastRequest,
@@ -67,6 +74,21 @@ _FREQ_ORDER_CAP = {12: 5, 52: 6, 4: 1}
 #: hold-out AND inaccurate in absolute terms.
 _GUARD_RATIO = 1.5
 _GUARD_REL_RMSE = 0.25
+#: Model tournament: rolling origins per period and the FTGM tie margin (MAE ratio).
+_ORIGINS = {12: 6, 52: 8, 4: 4}
+_FTGM_TIE = 1.03
+#: Ridge penalties tried by Algorithm 1 together with the Fourier order (0 = paper OLS).
+_RIDGE_GRID = (0.0, 0.5, 3.0, 10.0)
+_FTGM_FAMILY = ("FTGM", "FTGMCombo")
+_MODEL_WORD = {
+    "FTGM": "FTGM",
+    "FTGMCombo": "FTGM combinado",
+    "DampedTrend": "suavizado de nivel",
+    "SeasonalDamped": "suavizado estacional",
+    "SeasonalNaive": "repetir la temporada anterior",
+    "CrostonSBA": "Croston-SBA",
+    "MovingAverage": "promedio móvil",
+}
 
 _FREQ_LABEL = {12: "mensual", 52: "semanal", 4: "trimestral"}
 _PERIOD_WORD = {12: ("mes", "meses"), 52: ("semana", "semanas"), 4: ("trimestre", "trimestres")}
@@ -247,8 +269,16 @@ class ForecastService:
         diag: ProductDiagnostics,
         warnings: list[str],
     ) -> ProductForecast:
+        """Model tournament: the FTGM against honest challengers on the same past data.
+
+        Every contender is re-fitted at several past origins and scored on the periods it
+        had not seen (rolling origin). The one that missed the fewest units wins; a
+        technical tie (within ``_FTGM_TIE``) goes to the FTGM family, the thesis model.
+        The winner is then fitted on the full history to produce the forecast.
+        """
         config = FTGMConfig(period=period)
         n = clean.size
+        horizon = len(future_dates)
         nyquist = max(1, math.ceil(period / 2) - 1)
         season_cap = max(1, int(round(2.0 * n / period)))
         cap = min(nyquist, _FREQ_ORDER_CAP.get(period, nyquist), season_cap)
@@ -260,96 +290,195 @@ class ForecastService:
         if validation_size is None and period >= 52:
             validation_size = max(1, min(13, n // 4))
 
+        # --- Algorithm 1: Fourier order for the FTGM contender --------------------
+        order: int | None = None
         try:
-            selection = select_order(clean, config, validation_size=validation_size, max_order=cap)
-            model = FTGM(order=selection.best_order, config=config).fit(clean)
-            result = model.predict(len(future_dates))
-        except FTGMError as exc:
+            selection = select_order(
+                clean, config, validation_size=validation_size, max_order=cap, ridges=_RIDGE_GRID
+            )
+            order = selection.best_order
+            config = replace(config, ridge=selection.best_ridge)
+            diag.validation_size = selection.validation_size
+            diag.order_scores = {k: _r(v) for k, v in selection.scores.items()}
+            best = selection.scores.get(order)
+            diag.validation_rmse = _r(best) if best is not None else None
             diag.explanations.append(
-                f"El FTGM no pudo ajustarse de forma estable ({exc}); se usó el baseline estacional."
+                f"Algoritmo 1: se probaron órdenes de Fourier 1…{cap} (tope por largo de historia y Nyquist) "
+                f"y se eligió N = {order} por menor RMSE en validación"
+                + (
+                    f", con regularización ridge λ = {selection.best_ridge:g} (evita que el ruido se lea "
+                    "como temporada)."
+                    if selection.best_ridge > 0
+                    else " (estimación por mínimos cuadrados, como en el paper)."
+                )
             )
-            return self._forecast_seasonal_naive(
-                product_id, clean, observed, flags, outliers, buckets, future_dates, period, diag, warnings,
-                reason=str(exc),
-            )
-        assert model.fitted_ is not None
+        except FTGMError as exc:
+            diag.explanations.append(f"El FTGM no pudo ajustarse de forma estable ({exc}).")
 
-        diag.validation_size = selection.validation_size
-        diag.order_scores = {k: _r(v) for k, v in selection.scores.items()}
-        best = selection.scores.get(selection.best_order)
-        diag.validation_rmse = _r(best) if best is not None else None
-        diag.explanations.append(
-            f"Algoritmo 1: se probaron órdenes de Fourier 1…{cap} (tope por largo de historia y Nyquist) "
-            f"y se eligió N = {selection.best_order} por menor RMSE en validación."
-        )
+        # --- contenders --------------------------------------------------------------
+        h_eval = max(1, min(horizon, 6 if period < 52 else 8))
+        n_origins = _ORIGINS.get(period, 6)
+        min_train = max(8, 2 + 4 * (order or 1) + 3)
 
-        # Rolling-origin hold-out: FTGM (fixed order) vs seasonal naive on the same origins.
-        h_eval = max(1, min(len(future_dates), 6 if period < 52 else 8))
-        n_origins = 3 if period < 52 else 4
-        min_train = max(8, 2 + 4 * selection.best_order + 3)
+        # Every origin's train set is a prefix of ``clean``, so (length, h) identifies it:
+        # the FTGM combo reuses the FTGM forecasts instead of re-solving the ODE.
+        ftgm_cache: dict[tuple[int, int], FloatArray] = {}
 
         def ftgm_fc(train: FloatArray, h: int) -> FloatArray:
-            return FTGM(order=selection.best_order, config=config).fit(train).predict(h).point
+            assert order is not None
+            key = (train.size, h)
+            if key not in ftgm_cache:
+                ftgm_cache[key] = FTGM(order=order, config=config).fit(train).predict(h).point
+            return ftgm_cache[key]
+
+        def damped_fc(train: FloatArray, h: int) -> FloatArray:
+            return damped_trend_forecast(train, h)[0]
+
+        def combo_fc(train: FloatArray, h: int) -> FloatArray:
+            return 0.5 * (np.clip(ftgm_fc(train, h), 0.0, None) + naive_fc(train, h))
 
         def naive_fc(train: FloatArray, h: int) -> FloatArray:
             return seasonal_naive_forecast(train, h, period)
 
-        hold = rolling_origin(clean, ftgm_fc, horizon=h_eval, n_origins=n_origins, min_train=min_train, period=period)
-        naive = rolling_origin(clean, naive_fc, horizon=h_eval, n_origins=n_origins, min_train=min_train, period=period)
+        def seasonal_fc(train: FloatArray, h: int) -> FloatArray:
+            return seasonal_damped_forecast(train, h, period)[0]
+
+        contenders: dict[str, Callable[[FloatArray, int], FloatArray]] = {}
+        if order is not None:
+            contenders["FTGM"] = ftgm_fc
+            contenders["FTGMCombo"] = combo_fc
+        contenders["DampedTrend"] = damped_fc
+        contenders["SeasonalNaive"] = naive_fc
+        # Seasonal decomposition needs two full seasons in every training window.
+        if n - h_eval - (n_origins - 1) >= 2 * period:
+            contenders["SeasonalDamped"] = seasonal_fc
+
+        scores: dict[str, HoldoutScore] = {}
+        for name, fc in contenders.items():
+            score = rolling_origin(clean, fc, horizon=h_eval, n_origins=n_origins, min_train=min_train, period=period)
+            if score is not None:
+                scores[name] = score
+
+        winner = self._pick_winner(scores, order is not None)
+        naive = scores.get("SeasonalNaive")
+        hold = scores.get(winner) if winner else None
         diag.holdout = self._holdout(hold)
         diag.naive_holdout = self._holdout(naive)
         if hold is not None and naive is not None and naive.rmse > 0:
             diag.skill_vs_naive = _r(1.0 - hold.rmse / naive.rmse, 3)
+        diag.accuracy_pct = _r(hold.accuracy_pct, 1) if hold is not None else None
+        diag.candidates = [
+            CandidateScore(
+                model=name,
+                mae=_r(s.mae),
+                wape=_r(s.wape, 2),
+                accuracy_pct=_r(s.accuracy_pct, 1),
+                chosen=name == winner,
+            )
+            for name, s in sorted(scores.items(), key=lambda kv: kv[1].mae)
+        ]
+        if scores:
+            ranking = ", ".join(
+                f"{_MODEL_WORD.get(c.model, c.model)} {c.accuracy_pct:.0f}%"
+                for c in diag.candidates
+                if c.accuracy_pct is not None
+            )
+            diag.explanations.append(
+                f"Competencia de modelos en {hold.origins if hold else n_origins} cortes del pasado "
+                f"({_plural(h_eval, period)} adelante), precisión sobre el total: {ranking}."
+            )
 
-        mean_level = float(np.mean(clean)) if clean.size else 0.0
-        if (
-            hold is not None
-            and naive is not None
-            and naive.rmse > 0
-            and hold.rmse > _GUARD_RATIO * naive.rmse
-            and mean_level > 0
-            and hold.rmse / mean_level > _GUARD_REL_RMSE
-        ):
+        # --- final fit of the winner on the whole history ----------------------------
+        if winner is None:
+            winner = "FTGM" if order is not None else "DampedTrend"
+        try:
+            point, fitted = self._fit_final(winner, clean, horizon, period, config, order)
+        except (FTGMError, ValueError, np.linalg.LinAlgError) as exc:
+            diag.explanations.append(f"El modelo elegido falló al ajustarse con toda la historia ({exc}).")
+            winner = "DampedTrend"
+            hold = scores.get(winner)
+            point, fitted = damped_trend_forecast(clean, horizon)
+
+        is_ftgm = winner in _FTGM_FAMILY
+        reason = None
+        if not is_ftgm:
+            ftgm_score = scores.get("FTGM")
+            versus = ""
+            if (
+                hold is not None
+                and ftgm_score is not None
+                and hold.accuracy_pct is not None
+                and ftgm_score.accuracy_pct is not None
+            ):
+                versus = f" ({hold.accuracy_pct:.0f}% vs {ftgm_score.accuracy_pct:.0f}% de precisión)"
             reason = (
-                f"En validación el FTGM (RMSE {hold.rmse:.1f}) fue claramente peor que el baseline estacional "
-                f"(RMSE {naive.rmse:.1f}); se usa el baseline para no arriesgar la reposición."
+                f"Con tus ventas pasadas, {_MODEL_WORD.get(winner, winner)} acertó más que el FTGM{versus}; "
+                "se usa ese modelo para no arriesgar la reposición."
             )
             diag.explanations.append(reason)
-            return self._forecast_seasonal_naive(
-                product_id, clean, observed, flags, outliers, buckets, future_dates, period, diag, warnings,
-                reason=reason,
-            )
-
-        if hold is not None:
-            mape_txt = f"MAPE {hold.mape:.1f}%" if hold.mape is not None else f"RMSE {hold.rmse:.1f}"
+        elif winner == "FTGMCombo":
             diag.explanations.append(
-                f"Validación rolling-origin ({hold.origins} orígenes, {_plural(hold.horizon, period)} adelante): "
-                f"{mape_txt}"
-                + (
-                    f"; {abs(diag.skill_vs_naive) * 100:.0f}% {'mejor' if diag.skill_vs_naive >= 0 else 'peor'} "
-                    "que el baseline estacional."
-                    if diag.skill_vs_naive is not None
-                    else "."
-                )
+                "Ganó el FTGM combinado: el promedio del FTGM y de la misma temporada del año anterior, "
+                "que reduce el ruido de las ventas pequeñas sin perder la forma estacional."
             )
 
-        residuals = clean - model.fitted_
-        point = np.clip(result.point, 0.0, None)
+        residuals = clean - fitted
+        point = np.clip(np.nan_to_num(point, nan=0.0), 0.0, None)
         lower, upper = self._interval(point, residuals, hold)
         self._explain_forecast(diag, point, clean, period)
         return ProductForecast(
             product_id=product_id,
-            model=request.model,
-            order_selected=selection.best_order,
-            status="ok",
+            model=(request.model if winner == "FTGM" else winner),
+            order_selected=(order or _BASELINE_ORDER) if is_ftgm else _BASELINE_ORDER,
+            status="ok" if is_ftgm else "fallback",
+            fallback_reason=reason,
             warnings=warnings,
             frequency=diag.frequency,
             period=period,
             points=self._build_points(future_dates, point, lower, upper),
-            history=self._build_history(buckets, observed, clean, model.fitted_, flags, outliers),
-            metrics=self._in_sample_metrics(clean, model.fitted_, period),
+            history=self._build_history(buckets, observed, clean, fitted, flags, outliers),
+            metrics=self._in_sample_metrics(clean, fitted, period),
             diagnostics=diag,
         )
+
+    @staticmethod
+    def _pick_winner(scores: dict[str, HoldoutScore], ftgm_available: bool) -> str | None:
+        if not scores:
+            return None
+        best = min(scores, key=lambda k: scores[k].mae)
+        if best in _FTGM_FAMILY or not ftgm_available:
+            return best
+        family = [k for k in _FTGM_FAMILY if k in scores]
+        if family:
+            top = min(family, key=lambda k: scores[k].mae)
+            if scores[top].mae <= _FTGM_TIE * scores[best].mae:
+                return top
+        return best
+
+    @staticmethod
+    def _fit_final(
+        winner: str, clean: FloatArray, horizon: int, period: int, config: FTGMConfig, order: int | None
+    ) -> tuple[FloatArray, FloatArray]:
+        if winner in _FTGM_FAMILY:
+            assert order is not None
+            model = FTGM(order=order, config=config).fit(clean)
+            assert model.fitted_ is not None
+            point = np.clip(model.predict(horizon).point, 0.0, None)
+            fitted = model.fitted_
+            if winner == "FTGMCombo":
+                s_point = seasonal_naive_forecast(clean, horizon, period)
+                season = period if clean.size > period else 1
+                s_fit = np.concatenate([clean[:season], clean[:-season]]) if clean.size > season else clean.copy()
+                return 0.5 * (point + s_point), 0.5 * (fitted + s_fit)
+            return point, fitted
+        if winner == "SeasonalDamped":
+            return seasonal_damped_forecast(clean, horizon, period)
+        if winner == "SeasonalNaive":
+            point = seasonal_naive_forecast(clean, horizon, period)
+            season = period if clean.size > period else 1
+            fitted = np.concatenate([clean[:season], clean[:-season]]) if clean.size > season else clean.copy()
+            return point, fitted
+        return damped_trend_forecast(clean, horizon)
 
     # ------------------------------------------------------------------ baselines
     def _forecast_seasonal_naive(
@@ -400,10 +529,10 @@ class ForecastService:
         warnings: list[str],
     ) -> ProductForecast:
         point, fitted = croston_sba(repaired, len(future_dates))
-        residuals = repaired - fitted
-        sigma = float(np.std(residuals, ddof=1)) if residuals.size > 1 else 0.0
-        lower = np.clip(point - _INTERVAL_Z * sigma, 0.0, None)
-        upper = point + _INTERVAL_Z * sigma
+        hold = self._score_single(
+            "CrostonSBA", lambda tr, h: croston_sba(tr, h)[0], repaired, len(future_dates), period, diag,
+        )
+        lower, upper = self._interval(point, repaired - fitted, hold)
         reason = (
             f"Demanda intermitente: {diag.zero_share * 100:.0f}% de los periodos sin ventas (> 50%). "
             "Se usa Croston-SBA, que pronostica una tasa de demanda estable y es más adecuado que el FTGM "
@@ -443,7 +572,11 @@ class ForecastService:
     ) -> ProductForecast:
         window = 8 if period >= 52 else 3
         point, fitted = moving_average_forecast(clean, len(future_dates), window)
-        lower, upper = self._interval(point, clean - fitted, None)
+        hold = self._score_single(
+            "MovingAverage", lambda tr, h: moving_average_forecast(tr, h, window)[0], clean, len(future_dates),
+            period, diag,
+        )
+        lower, upper = self._interval(point, clean - fitted, hold)
         reason = diag.frequency_reason or "Historia corta: se usa un promedio móvil."
         self._explain_forecast(diag, point, clean, period)
         return ProductForecast(
@@ -460,6 +593,31 @@ class ForecastService:
             metrics=self._in_sample_metrics(clean, fitted, period),
             diagnostics=diag,
         )
+
+    def _score_single(
+        self,
+        name: str,
+        forecaster: Callable[[FloatArray, int], FloatArray],
+        x: FloatArray,
+        horizon: int,
+        period: int,
+        diag: ProductDiagnostics,
+    ) -> HoldoutScore | None:
+        """Honest past accuracy for the non-tournament paths (intermittent / short)."""
+        h_eval = max(1, min(horizon, 6 if period < 52 else 8))
+        hold = rolling_origin(
+            x, forecaster, horizon=h_eval, n_origins=_ORIGINS.get(period, 6), min_train=6, period=period
+        )
+        if hold is None:
+            return None
+        diag.holdout = self._holdout(hold)
+        diag.accuracy_pct = _r(hold.accuracy_pct, 1)
+        diag.candidates = [
+            CandidateScore(
+                model=name, mae=_r(hold.mae), wape=_r(hold.wape, 2), accuracy_pct=diag.accuracy_pct, chosen=True
+            )
+        ]
+        return hold
 
     @staticmethod
     def _skipped(series: ProductSeries, *, reason: str) -> ProductForecast:
@@ -490,6 +648,8 @@ class ForecastService:
             rmse=_r(score.rmse),
             mape=_r(score.mape),
             mase=_r(score.mase),
+            wape=_r(score.wape, 2),
+            total_wape=_r(score.total_wape, 2),
         )
 
     @staticmethod
